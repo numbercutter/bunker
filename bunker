@@ -1,0 +1,120 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+OLLAMA_IMAGE=ollama/ollama:0.40.17
+CHECK_IMAGE=alpine:3.24.4
+CORE_NET=bunker_core
+MODELS_VOLUME=bunker_models
+
+compose() {
+  docker compose --project-directory "$ROOT" -f "$ROOT/docker-compose.yml" "$@"
+}
+
+secret() {
+  od -An -N24 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+ensure_env() {
+  if [ ! -f "$ROOT/.env" ]; then
+    umask 077
+    {
+      echo "POSTGRES_PASSWORD=$(secret)"
+      echo "WEBUI_SECRET_KEY=$(secret)"
+    } >"$ROOT/.env"
+    echo "wrote $ROOT/.env with fresh secrets"
+  fi
+}
+
+usage() {
+  cat <<USAGE
+usage: bunker <command>
+
+  up              start the stack (creates .env on first run)
+  down            stop the stack, keep data
+  status          containers and installed models
+  pull <model>    download a model into the shared volume (needs internet)
+  check           prove the core network has no outbound route
+  logs [service]  follow logs
+USAGE
+}
+
+cmd_up() {
+  ensure_env
+  compose up -d
+  echo "open http://127.0.0.1:3000"
+}
+
+cmd_down() {
+  compose down
+}
+
+cmd_status() {
+  compose ps
+  echo
+  echo "models:"
+  if compose exec -T ollama ollama list 2>/dev/null; then :; else echo "  (ollama not running)"; fi
+}
+
+cmd_pull() {
+  [ $# -eq 1 ] || { echo "usage: bunker pull <model>" >&2; exit 2; }
+  model=$1
+  echo "pulling $model into volume $MODELS_VOLUME (temporary container, normal network)"
+  docker volume create "$MODELS_VOLUME" >/dev/null
+  docker run --rm \
+    --name bunker-pull \
+    -v "$MODELS_VOLUME:/root/.ollama" \
+    -e OLLAMA_HOST=127.0.0.1:11434 \
+    --entrypoint /bin/sh \
+    "$OLLAMA_IMAGE" -c '
+      ollama serve >/dev/null 2>&1 &
+      i=0
+      until ollama list >/dev/null 2>&1; do
+        i=$((i+1)); [ "$i" -gt 60 ] && { echo "ollama did not start" >&2; exit 1; }
+        sleep 1
+      done
+      ollama pull "$1"
+    ' sh "$model"
+  echo "done. the pull container has exited; the stack stays offline."
+}
+
+cmd_check() {
+  if ! docker network inspect "$CORE_NET" >/dev/null 2>&1; then
+    echo "network $CORE_NET not found. run: bunker up" >&2
+    exit 2
+  fi
+  internal=$(docker network inspect -f '{{.Internal}}' "$CORE_NET")
+  echo "network $CORE_NET internal=$internal"
+  if docker run --rm --network "$CORE_NET" \
+      -v "$ROOT/src/check.sh:/check.sh:ro" \
+      "$CHECK_IMAGE" sh /check.sh; then
+    if [ "$internal" = "true" ]; then
+      echo "PASS  no outbound access from $CORE_NET"
+      exit 0
+    fi
+  fi
+  echo "FAIL  $CORE_NET can reach the internet" >&2
+  exit 1
+}
+
+cmd_logs() {
+  compose logs -f --tail 100 "$@"
+}
+
+[ $# -ge 1 ] || { usage; exit 2; }
+cmd=$1
+shift
+case "$cmd" in
+  -h|--help|help) usage; exit 0 ;;
+esac
+command -v docker >/dev/null 2>&1 || { echo "docker not found" >&2; exit 2; }
+docker info >/dev/null 2>&1 || { echo "docker daemon not running" >&2; exit 2; }
+case "$cmd" in
+  up) cmd_up ;;
+  down) cmd_down ;;
+  status) cmd_status ;;
+  pull) cmd_pull "$@" ;;
+  check) cmd_check ;;
+  logs) cmd_logs "$@" ;;
+  *) usage; exit 2 ;;
+esac

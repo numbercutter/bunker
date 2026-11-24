@@ -1,0 +1,20 @@
+{
+  "name": "@numbercutter/bunker",
+  "version": "0.1.0",
+  "description": "Your AI, behind your walls.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "bunker": "./bunker"
+  },
+  "files": [
+    "bunker",
+    "docker-compose.yml",
+    "src",
+    ".env.example"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/numbercutter/bunker"
+  }
+}

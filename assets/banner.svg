@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+<rect width="1280" height="640" fill="#1F2A1C"/>
+<g transform="translate(96 224) scale(3)"><path d="M14 0 H46 L64 18 V50 Q64 64 50 64 H14 Q0 64 0 50 V14 Q0 0 14 0 Z" fill="#1F2A1C"/><path d="M22 48 V31 A10 10 0 0 1 42 31 V48" fill="none" stroke="#A3E635" stroke-width="5" stroke-linejoin="round"/><path d="M15.5 48.5 H48.5" stroke="#A3E635" stroke-width="5" stroke-linecap="round"/><path d="M14 0 H46 L64 18 V50 Q64 64 50 64 H14 Q0 64 0 50 V14 Q0 0 14 0 Z" fill="none" stroke="#9A9F99" stroke-opacity="0.35" stroke-width="0.5"/></g>
+<text x="352" y="330" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" font-size="120" fill="#A3E635">bunker</text>
+<text x="356" y="398" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="36" fill="#9A9F99">Your AI, behind your walls.</text>
+<text x="1232" y="600" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#9A9F99" fill-opacity="0.7">a numbercutter instrument</text>
+</svg>

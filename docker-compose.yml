@@ -1,0 +1,91 @@
+name: bunker
+
+services:
+  ollama:
+    image: ollama/ollama:0.40.17
+    restart: unless-stopped
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+    volumes:
+      - models:/root/.ollama
+    networks:
+      - core
+
+  qdrant:
+    image: qdrant/qdrant:v1.20.2
+    restart: unless-stopped
+    environment:
+      QDRANT__TELEMETRY_DISABLED: "true"
+    volumes:
+      - vectors:/qdrant/storage
+    networks:
+      - core
+
+  postgres:
+    image: postgres:18.7-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: bunker
+      POSTGRES_DB: bunker
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run ./bunker up to create .env}
+    volumes:
+      - database:/var/lib/postgresql
+    networks:
+      - core
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bunker -d bunker"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:v0.13.4
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+      qdrant:
+        condition: service_started
+    environment:
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?run ./bunker up to create .env}
+      DATABASE_URL: postgresql://bunker:${POSTGRES_PASSWORD}@postgres:5432/bunker
+      OLLAMA_BASE_URL: http://ollama:11434
+      VECTOR_DB: qdrant
+      QDRANT_URI: http://qdrant:6333
+      RAG_EMBEDDING_ENGINE: ollama
+      RAG_EMBEDDING_MODEL: ${BUNKER_EMBED_MODEL:-nomic-embed-text}
+      OFFLINE_MODE: "true"
+      HF_HUB_OFFLINE: "1"
+      ENABLE_OPENAI_API: "false"
+      ENABLE_WEB_SEARCH: "false"
+      ENABLE_COMMUNITY_SHARING: "false"
+      ENABLE_VERSION_UPDATE_CHECK: "false"
+      SCARF_NO_ANALYTICS: "true"
+      DO_NOT_TRACK: "true"
+      ANONYMIZED_TELEMETRY: "false"
+    volumes:
+      - webui:/app/backend/data
+    ports:
+      - "127.0.0.1:3000:8080"
+    networks:
+      - core
+      - edge
+
+networks:
+  core:
+    name: bunker_core
+    internal: true
+  edge:
+    name: bunker_edge
+
+volumes:
+  models:
+    name: bunker_models
+  vectors:
+    name: bunker_vectors
+  database:
+    name: bunker_database
+  webui:
+    name: bunker_webui

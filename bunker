@@ -3,12 +3,53 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 OLLAMA_IMAGE=ollama/ollama:0.40.17
-CHECK_IMAGE=alpine:3.24.4
-CORE_NET=bunker_core
-MODELS_VOLUME=bunker_models
+TOOL_IMAGE=alpine:3.24.4
+SEALED_NETS="bunker_core bunker_front"
+EDGE_NET=bunker_edge
+VOLUMES="models vectors database webui"
+ALL_PROFILES=cpu,gpu,host
+
+env_get() {
+  [ -f "$ROOT/.env" ] || return 0
+  sed -n "s/^$1=//p" "$ROOT/.env" | tail -n 1
+}
+
+env_set() {
+  if grep -q "^$1=" "$ROOT/.env" 2>/dev/null; then
+    tmp="$ROOT/.env.tmp.$$"
+    sed "s|^$1=.*|$1=$2|" "$ROOT/.env" >"$tmp" && cat "$tmp" >"$ROOT/.env" && rm -f "$tmp"
+  else
+    echo "$1=$2" >>"$ROOT/.env"
+  fi
+}
+
+mode() {
+  m=$(env_get BUNKER_MODE)
+  echo "${m:-cpu}"
+}
 
 compose() {
-  docker compose --project-directory "$ROOT" -f "$ROOT/docker-compose.yml" "$@"
+  m=$(mode)
+  if [ "$m" = host ]; then
+    host_ollama=$(env_get BUNKER_HOST_OLLAMA)
+    BUNKER_OLLAMA_URL=http://proxy:11434 \
+    BUNKER_HOST_OLLAMA=${host_ollama:-host.docker.internal:11434} \
+    COMPOSE_PROFILES=host \
+      docker compose --project-directory "$ROOT" -f "$ROOT/docker-compose.yml" "$@"
+  else
+    COMPOSE_PROFILES=$m docker compose --project-directory "$ROOT" -f "$ROOT/docker-compose.yml" "$@"
+  fi
+}
+
+compose_all() {
+  COMPOSE_PROFILES=$ALL_PROFILES docker compose --project-directory "$ROOT" -f "$ROOT/docker-compose.yml" "$@"
+}
+
+ollama_service() {
+  case $(mode) in
+    gpu) echo ollama-gpu ;;
+    *) echo ollama ;;
+  esac
 }
 
 secret() {
@@ -21,6 +62,7 @@ ensure_env() {
     {
       echo "POSTGRES_PASSWORD=$(secret)"
       echo "WEBUI_SECRET_KEY=$(secret)"
+      echo "BUNKER_MODE=cpu"
     } >"$ROOT/.env"
     echo "wrote $ROOT/.env with fresh secrets"
   fi
@@ -30,40 +72,70 @@ usage() {
   cat <<USAGE
 usage: bunker <command>
 
-  up              start the stack (creates .env on first run)
-  down            stop the stack, keep data
-  status          containers and installed models
-  pull <model>    download a model into the shared volume (needs internet)
-  check           prove the core network has no outbound route
-  logs [service]  follow logs
+  up [--cpu|--gpu|--host]   start the stack (creates .env on first run)
+  down                      stop the stack, keep data
+  status                    containers and installed models
+  pull <model>              download a model into the shared volume (needs internet)
+  check                     prove the sealed networks have no outbound route
+  logs [service]            follow logs
+  backup [--skip-models] [dir]
+                            archive the volumes to dir (default ./backups)
+  restore <file> [--yes]    replace the volumes with an archive from backup
+  doctor                    explain what is missing and how to fix it
+
+modes: --cpu runs Ollama in a container (default), --gpu adds an NVIDIA
+reservation (Linux), --host uses an Ollama already running on this machine.
 USAGE
 }
 
 cmd_up() {
   ensure_env
+  want=""
+  for arg in "$@"; do
+    case "$arg" in
+      --cpu) want=cpu ;;
+      --gpu) want=gpu ;;
+      --host) want=host ;;
+      *) usage >&2; exit 2 ;;
+    esac
+  done
+  if [ -n "$want" ] && [ "$want" != "$(mode)" ]; then
+    compose_all down
+    env_set BUNKER_MODE "$want"
+    echo "mode set to $want"
+  fi
   compose up -d
-  echo "open http://127.0.0.1:3000"
+  echo "mode $(mode). open http://127.0.0.1:3000"
 }
 
 cmd_down() {
-  compose down
+  compose_all down
 }
 
 cmd_status() {
+  echo "mode: $(mode)"
   compose ps
   echo
   echo "models:"
-  if compose exec -T ollama ollama list 2>/dev/null; then :; else echo "  (ollama not running)"; fi
+  if [ "$(mode)" = host ]; then
+    echo "  served by the Ollama on this machine (run: ollama list)"
+  elif compose exec -T "$(ollama_service)" ollama list 2>/dev/null; then :; else
+    echo "  (ollama not running)"
+  fi
 }
 
 cmd_pull() {
   [ $# -eq 1 ] || { echo "usage: bunker pull <model>" >&2; exit 2; }
+  if [ "$(mode)" = host ]; then
+    echo "mode is host: pull on this machine instead: ollama pull $1" >&2
+    exit 2
+  fi
   model=$1
-  echo "pulling $model into volume $MODELS_VOLUME (temporary container, normal network)"
-  docker volume create "$MODELS_VOLUME" >/dev/null
+  echo "pulling $model into volume bunker_models (temporary container, normal network)"
+  docker volume create bunker_models >/dev/null
   docker run --rm \
     --name bunker-pull \
-    -v "$MODELS_VOLUME:/root/.ollama" \
+    -v "bunker_models:/root/.ollama" \
     -e OLLAMA_HOST=127.0.0.1:11434 \
     --entrypoint /bin/sh \
     "$OLLAMA_IMAGE" -c '
@@ -78,22 +150,39 @@ cmd_pull() {
   echo "done. the pull container has exited; the stack stays offline."
 }
 
+edge_services() {
+  ids=$(docker network inspect -f '{{range $id, $c := .Containers}}{{$id}} {{end}}' "$EDGE_NET")
+  for id in $ids; do
+    docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$id"
+  done
+}
+
 cmd_check() {
-  if ! docker network inspect "$CORE_NET" >/dev/null 2>&1; then
-    echo "network $CORE_NET not found. run: bunker up" >&2
-    exit 2
-  fi
-  internal=$(docker network inspect -f '{{.Internal}}' "$CORE_NET")
-  echo "network $CORE_NET internal=$internal"
-  if docker run --rm --network "$CORE_NET" \
-      -v "$ROOT/src/check.sh:/check.sh:ro" \
-      "$CHECK_IMAGE" sh /check.sh; then
-    if [ "$internal" = "true" ]; then
-      echo "PASS  no outbound access from $CORE_NET"
-      exit 0
+  fail=0
+  for net in $SEALED_NETS $EDGE_NET; do
+    if ! docker network inspect "$net" >/dev/null 2>&1; then
+      echo "network $net not found. run: bunker up" >&2
+      exit 2
     fi
+  done
+  for net in $SEALED_NETS; do
+    internal=$(docker network inspect -f '{{.Internal}}' "$net")
+    echo "network $net internal=$internal"
+    [ "$internal" = true ] || fail=1
+    if ! docker run --rm --network "$net" \
+        -v "$ROOT/src/check.sh:/check.sh:ro" \
+        "$TOOL_IMAGE" sh /check.sh; then
+      fail=1
+    fi
+  done
+  edge=$(edge_services | sort -u | tr '\n' ' ' | sed 's/ $//')
+  echo "network $EDGE_NET members: ${edge:-none}"
+  [ "$edge" = proxy ] || fail=1
+  if [ "$fail" -eq 0 ]; then
+    echo "PASS  no outbound access from $SEALED_NETS; only proxy is on $EDGE_NET"
+    exit 0
   fi
-  echo "FAIL  $CORE_NET can reach the internet" >&2
+  echo "FAIL  a sealed network can reach out, or something other than proxy is on $EDGE_NET" >&2
   exit 1
 }
 
@@ -101,20 +190,201 @@ cmd_logs() {
   compose logs -f --tail 100 "$@"
 }
 
+cmd_backup() {
+  skip_models=0
+  out="$ROOT/backups"
+  for arg in "$@"; do
+    case "$arg" in
+      --skip-models) skip_models=1 ;;
+      -*) usage >&2; exit 2 ;;
+      *) out=$arg ;;
+    esac
+  done
+  mkdir -p "$out"
+  out=$(CDPATH= cd -- "$out" && pwd -P)
+  file="bunker-$(date +%Y%m%d-%H%M%S).tar.gz"
+  present=""
+  for v in $VOLUMES; do
+    [ "$v" = models ] && [ "$skip_models" -eq 1 ] && continue
+    if docker volume inspect "bunker_$v" >/dev/null 2>&1; then
+      present="$present $v"
+    else
+      echo "skip  bunker_$v (no such volume)"
+    fi
+  done
+  [ -n "$present" ] || { echo "no bunker volumes to back up" >&2; exit 1; }
+  running=$(compose_all ps -q --status running)
+  if [ -n "$running" ]; then
+    echo "stopping the stack so the database is consistent"
+    compose_all stop
+  fi
+  set -- -v "$out:/out"
+  for v in $present; do
+    set -- "$@" -v "bunker_$v:/v/$v:ro"
+  done
+  status=0
+  docker run --rm "$@" "$TOOL_IMAGE" sh -c 'cd /v && tar czf "/out/$1" $2' sh "$file" "$present" || status=$?
+  if [ -n "$running" ]; then
+    compose up -d
+  fi
+  [ "$status" -eq 0 ] || { echo "backup failed" >&2; rm -f "$out/$file"; exit 1; }
+  echo "wrote $out/$file ($(du -h "$out/$file" | cut -f1)) with:$present"
+}
+
+cmd_restore() {
+  file=""
+  yes=0
+  for arg in "$@"; do
+    case "$arg" in
+      --yes) yes=1 ;;
+      -*) usage >&2; exit 2 ;;
+      *) file=$arg ;;
+    esac
+  done
+  [ -n "$file" ] || { echo "usage: bunker restore <file> [--yes]" >&2; exit 2; }
+  [ -f "$file" ] || { echo "no such file: $file" >&2; exit 2; }
+  dir=$(CDPATH= cd -- "$(dirname -- "$file")" && pwd -P)
+  base=$(basename -- "$file")
+  found=$(docker run --rm -v "$dir:/in:ro" "$TOOL_IMAGE" \
+    sh -c 'tar tzf "/in/$1" | cut -d/ -f1 | sort -u' sh "$base")
+  vols=""
+  for v in $found; do
+    case " $VOLUMES " in
+      *" $v "*) vols="$vols $v" ;;
+      *) echo "unexpected entry in archive: $v" >&2; exit 1 ;;
+    esac
+  done
+  [ -n "$vols" ] || { echo "archive holds no bunker volumes" >&2; exit 1; }
+  echo "this replaces the contents of:$vols"
+  if [ "$yes" -ne 1 ]; then
+    if [ -t 0 ]; then
+      printf 'type yes to continue: '
+      read -r answer
+      [ "$answer" = yes ] || { echo "cancelled"; exit 1; }
+    else
+      echo "not a terminal: pass --yes to confirm" >&2
+      exit 2
+    fi
+  fi
+  compose_all down
+  set -- -v "$dir:/in:ro"
+  for v in $vols; do
+    docker volume create "bunker_$v" >/dev/null
+    set -- "$@" -v "bunker_$v:/v/$v"
+  done
+  docker run --rm "$@" "$TOOL_IMAGE" sh -c '
+    for v in $2; do find "/v/$v" -mindepth 1 -delete; done
+    tar xzf "/in/$1" -C /v
+  ' sh "$base" "$vols"
+  echo "restored:$vols. run: bunker up"
+}
+
+report() {
+  printf '%-5s %-16s %s\n' "$1" "$2" "$3"
+}
+
+fix() {
+  printf '      fix: %s\n' "$1"
+}
+
+cmd_doctor() {
+  bad=0
+  os=$(uname -s)
+  if command -v docker >/dev/null 2>&1; then
+    report ok "docker cli" "$(command -v docker)"
+  else
+    report FAIL "docker cli" "not installed"
+    if [ "$os" = Darwin ]; then
+      fix "install Docker Desktop, or: brew install docker colima && colima start"
+    else
+      fix "install Docker Engine: https://docs.docker.com/engine/install/"
+    fi
+    exit 1
+  fi
+  if info=$(docker info --format '{{.ServerVersion}}' 2>&1); then
+    report ok "docker daemon" "server $info"
+  else
+    bad=1
+    report FAIL "docker daemon" "not reachable"
+    case "$info" in
+      *"permission denied"*)
+        fix "add yourself to the docker group: sudo usermod -aG docker \$USER, then log in again" ;;
+      *colima*)
+        fix "start the VM: colima start" ;;
+      *)
+        if [ "$os" = Darwin ]; then
+          fix "open Docker Desktop, or if you use colima: colima start"
+        else
+          fix "sudo systemctl start docker"
+        fi ;;
+    esac
+  fi
+  if v=$(docker compose version --short 2>/dev/null); then
+    report ok "compose plugin" "$v"
+  else
+    bad=1
+    report FAIL "compose plugin" "docker compose is not available"
+    if [ "$os" = Darwin ]; then
+      fix "Docker Desktop ships it. With Homebrew: brew install docker-compose, then add"
+      fix "\"cliPluginsExtraDirs\": [\"$(brew --prefix 2>/dev/null || echo /opt/homebrew)/lib/docker/cli-plugins\"] to ~/.docker/config.json"
+    else
+      fix "sudo apt-get install docker-compose-plugin (or: sudo dnf install docker-compose-plugin)"
+    fi
+  fi
+  if [ -f "$ROOT/.env" ]; then
+    report ok ".env" "present, mode $(mode)"
+  else
+    report info ".env" "not created yet; bunker up writes it"
+  fi
+  case $(mode) in
+    gpu)
+      if [ "$os" = Darwin ]; then
+        bad=1
+        report FAIL "gpu" "Docker on macOS cannot use the Mac GPU"
+        fix "run Ollama natively and use: bunker up --host"
+      elif docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q nvidia; then
+        report ok "gpu" "nvidia runtime registered"
+      else
+        bad=1
+        report FAIL "gpu" "nvidia runtime not registered with Docker"
+        fix "install the NVIDIA Container Toolkit, then: sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker"
+      fi ;;
+    host)
+      url=$(env_get BUNKER_HOST_OLLAMA)
+      if command -v curl >/dev/null 2>&1 && curl -fsS -m 3 http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
+        report ok "host ollama" "answering on 127.0.0.1:11434"
+      else
+        bad=1
+        report FAIL "host ollama" "nothing answering on 127.0.0.1:11434"
+        fix "install Ollama for this machine and run: ollama serve"
+      fi
+      [ -z "$url" ] || report info "host ollama" "proxy forwards to $url" ;;
+  esac
+  if [ "$bad" -eq 0 ]; then
+    echo "ready"
+  else
+    exit 1
+  fi
+}
+
 [ $# -ge 1 ] || { usage; exit 2; }
 cmd=$1
 shift
 case "$cmd" in
   -h|--help|help) usage; exit 0 ;;
+  doctor) cmd_doctor; exit $? ;;
 esac
-command -v docker >/dev/null 2>&1 || { echo "docker not found" >&2; exit 2; }
-docker info >/dev/null 2>&1 || { echo "docker daemon not running" >&2; exit 2; }
+command -v docker >/dev/null 2>&1 || { echo "docker not found. run: bunker doctor" >&2; exit 2; }
+docker info >/dev/null 2>&1 || { echo "docker daemon not running. run: bunker doctor" >&2; exit 2; }
+docker compose version >/dev/null 2>&1 || { echo "docker compose plugin missing. run: bunker doctor" >&2; exit 2; }
 case "$cmd" in
-  up) cmd_up ;;
+  up) cmd_up "$@" ;;
   down) cmd_down ;;
   status) cmd_status ;;
   pull) cmd_pull "$@" ;;
   check) cmd_check ;;
   logs) cmd_logs "$@" ;;
+  backup) cmd_backup "$@" ;;
+  restore) cmd_restore "$@" ;;
   *) usage; exit 2 ;;
 esac

@@ -1,15 +1,32 @@
 name: bunker
 
+x-ollama: &ollama
+  image: ollama/ollama:0.40.17
+  restart: unless-stopped
+  environment:
+    OLLAMA_HOST: 0.0.0.0:11434
+  volumes:
+    - models:/root/.ollama
+  networks:
+    core:
+      aliases:
+        - ollama
+
 services:
   ollama:
-    image: ollama/ollama:0.40.17
-    restart: unless-stopped
-    environment:
-      OLLAMA_HOST: 0.0.0.0:11434
-    volumes:
-      - models:/root/.ollama
-    networks:
-      - core
+    <<: *ollama
+    profiles: [cpu]
+
+  ollama-gpu:
+    <<: *ollama
+    profiles: [gpu]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
   qdrant:
     image: qdrant/qdrant:v1.20.2
@@ -44,14 +61,18 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      ollama:
-        condition: service_started
       qdrant:
         condition: service_started
+      ollama:
+        condition: service_started
+        required: false
+      ollama-gpu:
+        condition: service_started
+        required: false
     environment:
       WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?run ./bunker up to create .env}
       DATABASE_URL: postgresql://bunker:${POSTGRES_PASSWORD}@postgres:5432/bunker
-      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_BASE_URL: ${BUNKER_OLLAMA_URL:-http://ollama:11434}
       VECTOR_DB: qdrant
       QDRANT_URI: http://qdrant:6333
       RAG_EMBEDDING_ENGINE: ollama
@@ -67,15 +88,33 @@ services:
       ANONYMIZED_TELEMETRY: "false"
     volumes:
       - webui:/app/backend/data
+    networks:
+      - core
+      - front
+
+  proxy:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    depends_on:
+      - open-webui
+    environment:
+      BUNKER_HOST_OLLAMA: ${BUNKER_HOST_OLLAMA:-127.0.0.1:9}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      - ./src/Caddyfile:/etc/caddy/Caddyfile:ro
     ports:
       - "127.0.0.1:3000:8080"
     networks:
-      - core
+      - front
       - edge
 
 networks:
   core:
     name: bunker_core
+    internal: true
+  front:
+    name: bunker_front
     internal: true
   edge:
     name: bunker_edge
